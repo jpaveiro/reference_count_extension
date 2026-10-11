@@ -1,108 +1,119 @@
 import * as vscode from 'vscode';
 
-const SUPPORTED_LANGUAGES = new Set(['python', 'javascript', 'typescript', 'javascriptreact', 'typescriptreact']);
+const SUPPORTED_LANGUAGES = ['python', 'javascript', 'typescript', 'javascriptreact', 'typescriptreact'];
 const DEBOUNCE_DELAY = 300;
 
-let decorationType: vscode.TextEditorDecorationType;
-let updateTimeout: NodeJS.Timeout | undefined;
 let excludePatterns: RegExp[] = [];
-let decorationPosition: 'above' | 'inline' = 'inline';
 let excludeDeclaration: boolean = false;
 
-function updateDecorationType(): void {
-  decorationType?.dispose();
-
-  const config = vscode.workspace.getConfiguration('referenceCounter');
-  decorationPosition = config.get<'inline' | 'above'>('decorationPosition') || 'inline';
-
-  if (decorationPosition === 'above') {
-    decorationType = vscode.window.createTextEditorDecorationType({
-      isWholeLine: false,
-      before: {
-        contentText: '',
-        textDecoration: 'none; position: absolute; transform: translateY(-100%);',
-      },
-    });
-  } else {
-    decorationType = vscode.window.createTextEditorDecorationType({
-      after: {
-        margin: '0 0 0 0.8em',
-        textDecoration: 'none',
-      },
-    });
-  }
-}
-
-export async function activate(context: vscode.ExtensionContext) {
-
-  updateDecorationType();
-
-  // Initial decoration
-  if (vscode.window.activeTextEditor) {
-    console.log('Reference Counter: Initial editor found, updating decorations');
-    await updateDecorations(vscode.window.activeTextEditor);
-  }
-
-  // Update on editor change
-  context.subscriptions.push(
-    vscode.window.onDidChangeActiveTextEditor(async (editor) => {
-      console.log('Reference Counter: Active editor changed');
-      if (editor) {
-        await updateDecorations(editor);
-      }
-    })
-  );
-
-  // Debounced update on document change
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeTextDocument(async (event) => {
-      if (updateTimeout) {
-        clearTimeout(updateTimeout);
-      }
-
-      updateTimeout = setTimeout(async () => {
-        const editor = vscode.window.activeTextEditor;
-        if (editor && event.document === editor.document) {
-          console.log('Reference Counter: Document changed, updating decorations');
-          await updateDecorations(editor);
-        }
-      }, DEBOUNCE_DELAY);
-    })
-  );
-
-  // Update decoration type when configuration changes
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration(async (event) => {
-      if (event.affectsConfiguration('referenceCounter.decorationPosition')) {
-        console.log('Reference Counter: Decoration position configuration changed');
-        updateDecorationType();
-        const editor = vscode.window.activeTextEditor;
-        if (editor) {
-          await updateDecorations(editor);
-        }
-      }
-      if (event.affectsConfiguration('referenceCounter.excludeDeclaration')) {
-        console.log('Reference Counter: Exclude declaration configuration changed');
-        const editor = vscode.window.activeTextEditor;
-        if (editor) {
-          await updateDecorations(editor);
-        }
-      }
-    })
-  );
-}
-
-function loadExcludePatterns(): void {
+function loadConfiguration(): void {
   const config = vscode.workspace.getConfiguration('referenceCounter');
   const patterns = config.get<string[]>('excludePatterns') || [];
   excludePatterns = patterns.map(pattern => new RegExp(pattern.replace(/\*/g, '.*')));
   excludeDeclaration = config.get<boolean>('excludeDeclaration') || false;
 }
 
-async function getReferenceCount(
+/**
+ * A code lens that remembers which symbol it belongs to, so that the
+ * reference lookup can be deferred to resolveCodeLens.
+ */
+class ReferenceCodeLens extends vscode.CodeLens {
+  constructor(
+    range: vscode.Range,
+    public readonly uri: vscode.Uri,
+    public readonly position: vscode.Position
+  ) {
+    super(range);
+  }
+}
+
+class ReferenceCounterProvider implements vscode.CodeLensProvider<ReferenceCodeLens> {
+  private readonly changeEmitter = new vscode.EventEmitter<void>();
+  public readonly onDidChangeCodeLenses = this.changeEmitter.event;
+
+  public refresh(): void {
+    this.changeEmitter.fire();
+  }
+
+  public dispose(): void {
+    this.changeEmitter.dispose();
+  }
+
+  async provideCodeLenses(
+    document: vscode.TextDocument,
+    token: vscode.CancellationToken
+  ): Promise<ReferenceCodeLens[]> {
+    try {
+      loadConfiguration();
+
+      const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+        'vscode.executeDocumentSymbolProvider',
+        document.uri
+      );
+
+      if (token.isCancellationRequested || !symbols || !Array.isArray(symbols)) {
+        return [];
+      }
+
+      return collectSymbols(symbols).map(symbol => {
+        const line = symbol.selectionRange.start.line;
+        return new ReferenceCodeLens(
+          new vscode.Range(line, 0, line, 0),
+          document.uri,
+          symbol.selectionRange.start
+        );
+      });
+    } catch (error) {
+      console.error('Reference Counter: Error providing code lenses:', error);
+      return [];
+    }
+  }
+
+  async resolveCodeLens(
+    codeLens: ReferenceCodeLens,
+    token: vscode.CancellationToken
+  ): Promise<ReferenceCodeLens> {
+    const references = await getReferences(codeLens.uri, codeLens.position);
+
+    if (token.isCancellationRequested) {
+      return codeLens;
+    }
+
+    const count = references.length;
+
+    codeLens.command = {
+      title: `${count} ${count === 1 ? 'reference' : 'references'}`,
+      tooltip: count > 0 ? 'Show all references' : 'No references found',
+      command: count > 0 ? 'referenceCounter.showReferences' : '',
+      arguments: [codeLens.uri, codeLens.position, references],
+    };
+
+    return codeLens;
+  }
+}
+
+/**
+ * Top level symbols plus the methods of any class, matching the set of
+ * symbols the extension has always counted.
+ */
+function collectSymbols(symbols: vscode.DocumentSymbol[]): vscode.DocumentSymbol[] {
+  const collected: vscode.DocumentSymbol[] = [];
+
+  for (const symbol of symbols) {
+    collected.push(symbol);
+
+    if (symbol.kind === vscode.SymbolKind.Class) {
+      collected.push(...symbol.children.filter(child => child.kind === vscode.SymbolKind.Method));
+    }
+  }
+
+  return collected;
+}
+
+async function getReferences(
   uri: vscode.Uri,
   position: vscode.Position
-): Promise<number> {
+): Promise<vscode.Location[]> {
   try {
     const references = await vscode.commands.executeCommand<vscode.Location[]>(
       'vscode.executeReferenceProvider',
@@ -111,109 +122,73 @@ async function getReferenceCount(
     );
 
     if (!references || !Array.isArray(references)) {
-      return 0;
+      return [];
     }
 
     let filtered = references.filter(ref =>
       !excludePatterns.some(regex => regex.test(ref.uri.path))
     );
 
-    if (excludeDeclaration && filtered.length > 0) {
+    if (excludeDeclaration) {
       filtered = filtered.filter(ref =>
         !(ref.uri.toString() === uri.toString() && ref.range.start.isEqual(position))
       );
     }
 
-    return filtered.length;
+    return filtered;
   } catch (error) {
-    console.error('Reference Counter: Error getting reference count:', error);
-    return 0;
+    console.error('Reference Counter: Error getting references:', error);
+    return [];
   }
 }
 
-async function processSymbol(
-  uri: vscode.Uri,
-  symbol: vscode.DocumentSymbol
-): Promise<vscode.DecorationOptions[]> {
-  const decorations: vscode.DecorationOptions[] = [];
+export function activate(context: vscode.ExtensionContext) {
+  loadConfiguration();
 
-  console.log(`Reference Counter: Processing symbol ${symbol.name} (kind: ${symbol.kind})`);
+  const provider = new ReferenceCounterProvider();
+  context.subscriptions.push(provider);
 
-  // Process the symbol itself
-  const count = await getReferenceCount(uri, symbol.selectionRange.start);
-  decorations.push(createDecoration(count, symbol.range.start));
+  context.subscriptions.push(
+    vscode.languages.registerCodeLensProvider(
+      SUPPORTED_LANGUAGES.map(language => ({ language, scheme: 'file' })),
+      provider
+    )
+  );
 
-  // Process methods if it's a class
-  if (symbol.kind === vscode.SymbolKind.Class) {
-    const methods = symbol.children.filter(child => child.kind === vscode.SymbolKind.Method);
+  // Opens the peek references view on the symbol the lens belongs to.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'referenceCounter.showReferences',
+      async (uri: vscode.Uri, position: vscode.Position, locations: vscode.Location[]) => {
+        await vscode.commands.executeCommand('editor.action.showReferences', uri, position, locations);
+      }
+    )
+  );
 
-    for (const method of methods) {
-      const methodCount = await getReferenceCount(uri, method.selectionRange.start);
-      decorations.push(createDecoration(methodCount, method.range.start));
-    }
-  }
+  // Debounced refresh while typing, so counts follow the code being written.
+  let updateTimeout: NodeJS.Timeout | undefined;
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      if (!SUPPORTED_LANGUAGES.includes(event.document.languageId)) {
+        return;
+      }
 
-  return decorations;
+      if (updateTimeout) {
+        clearTimeout(updateTimeout);
+      }
+
+      updateTimeout = setTimeout(() => provider.refresh(), DEBOUNCE_DELAY);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('referenceCounter')) {
+        loadConfiguration();
+        provider.refresh();
+      }
+    })
+  );
 }
 
-function createDecoration(count: number, position: vscode.Position): vscode.DecorationOptions {
-  const color = count > 0 ? 'gray' : 'red';
-  const contentText = `(${count})`;
-
-  if (decorationPosition === 'above') {
-    return {
-      range: new vscode.Range(position, position),
-      renderOptions: {
-        before: {
-          contentText,
-          color,
-          textDecoration: `none; position: absolute; transform: translateY(-1.2em);`,
-        },
-      },
-    };
-  } else {
-    return {
-      range: new vscode.Range(position, position),
-      renderOptions: {
-        after: {
-          contentText,
-          color,
-        },
-      },
-    };
-  }
-}
-
-async function updateDecorations(editor: vscode.TextEditor): Promise<void> {
-  try {
-    if (!SUPPORTED_LANGUAGES.has(editor.document.languageId)) {
-      return;
-    }
-
-    loadExcludePatterns();
-
-    const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-      'vscode.executeDocumentSymbolProvider',
-      editor.document.uri
-    );
-
-
-    if (!symbols || !Array.isArray(symbols) || symbols.length === 0) {
-      return;
-    }
-
-    const decorations = await Promise.all(
-      symbols.map(symbol => processSymbol(editor.document.uri, symbol))
-    );
-
-    const flatDecorations = decorations.flat();
-
-    editor.setDecorations(decorationType, flatDecorations);
-  } catch (error) {
-    console.error('Reference Counter: Error updating decorations:', error);
-  }
-}
-
-export function deactivate() {
-  decorationType?.dispose();
-}
+export function deactivate() {}

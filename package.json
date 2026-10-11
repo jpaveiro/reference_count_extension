@@ -58,16 +58,6 @@
           },
           "description": "Patterns to exclude from reference counting. all file names that include the added string or folders that contain the added string will be excluded. Example: to exclude all files in the 'node_modules' folder, add 'node_modules' to the list."
         },
-        "referenceCounter.decorationPosition": {
-          "type": "string",
-          "default": "",
-          "enum": ["above", "inline"],
-          "enumDescriptions": [
-            "Display reference count above the symbol",
-            "Display reference count inline next to the symbol"
-          ],
-          "description": "Position of the reference count decoration relative to the symbol"
-        },
         "referenceCounter.excludeDeclaration": {
           "type": "boolean",
           "default": false,
